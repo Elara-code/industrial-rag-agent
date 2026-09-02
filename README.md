@@ -32,6 +32,8 @@ uvicorn backend.app.main:app --reload
 
 后端默认连接本地 PostgreSQL。真实运行还需配置 `DEEPSEEK_API_KEY`、`DASHSCOPE_API_KEY`、`BAIDU_API_KEY`、`BAIDU_SECRET_KEY`、`S3_BUCKET` 和 S3 凭据。原生 PDF/TXT 会按页提取并分块；无文本扫描页再使用百度 OCR。百度 OCR 的通用文字识别接口要求将图片 Base64 后通过 HTTPS POST 提交，并使用 API Key/Secret Key 换取 access_token。
 
+千问 `text-embedding-v3` 默认使用 `1024` 维向量；如修改 `EMBEDDING_DIM`，必须同步迁移 PostgreSQL 的 `vector` 列并重新生成已有文档向量。
+
 样本文档处理策略：`sample-resume.docx` 走 DOCX 文本解析，`sample-heavy.pdf` 对空白页转图后走百度 OCR，`sample-scanned.pdf` 全部页面转图后走百度 OCR。
 
 运行评测：

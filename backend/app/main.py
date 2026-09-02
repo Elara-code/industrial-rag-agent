@@ -25,7 +25,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 from pgvector.sqlalchemy import Vector
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://nihon:nihon@localhost:5432/nihon_agent")
-EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1536"))
+EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1024"))
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
 
