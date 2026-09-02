@@ -28,4 +28,11 @@ docker compose up -d postgres
 uvicorn backend.app.main:app --reload
 ```
 
-后端默认连接本地 PostgreSQL。真实运行还需配置 `DEEPSEEK_API_KEY`、`DASHSCOPE_API_KEY`、`BAIDU_API_KEY`、`BAIDU_SECRET_KEY`、`S3_BUCKET` 和 S3 凭据。百度 OCR 的通用文字识别接口要求将图片 Base64 后通过 HTTPS POST 提交，并使用 API Key/Secret Key 换取 access_token；当前 PDF/DOCX 上传仍进入待复核状态，下一步接入 PDF 页面转图和 OCR 结果分块。
+后端默认连接本地 PostgreSQL。真实运行还需配置 `DEEPSEEK_API_KEY`、`DASHSCOPE_API_KEY`、`BAIDU_API_KEY`、`BAIDU_SECRET_KEY`、`S3_BUCKET` 和 S3 凭据。原生 PDF/TXT 会按页提取并分块；无文本扫描页再使用百度 OCR。百度 OCR 的通用文字识别接口要求将图片 Base64 后通过 HTTPS POST 提交，并使用 API Key/Secret Key 换取 access_token。
+
+上传第一份样本文档：
+
+```bash
+curl -X POST 'http://127.0.0.1:8000/api/projects/demo/documents?department_id=生产部' \
+  -F 'file=@/Users/liuyawei/Downloads/20160412haieki.pdf;type=application/pdf'
+```

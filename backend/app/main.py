@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import uuid
+from io import BytesIO
 from datetime import datetime
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import boto3
 import httpx
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel
+from pypdf import PdfReader
 from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, create_engine, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 from pgvector.sqlalchemy import Vector
@@ -75,6 +77,15 @@ def split_chunks(value: str, size: int = 800) -> list[str]:
     if current:
         chunks.append(current)
     return chunks or [value[:size]]
+
+
+def extract_pages(data: bytes, filename: str) -> list[tuple[int, str]]:
+    suffix = Path(filename).suffix.lower()
+    if suffix == ".txt":
+        return [(1, data.decode("utf-8", errors="ignore"))]
+    if suffix == ".pdf":
+        return [(page_number, page.extract_text() or "") for page_number, page in enumerate(PdfReader(BytesIO(data)).pages, 1)]
+    return []
 
 
 def can_access(department_id: str, allowed_departments: list[str], visibility: str) -> bool:
@@ -167,17 +178,19 @@ async def upload_document(project_id: str, department_id: str, file: UploadFile 
     document_id, key = str(uuid.uuid4()), f"{project_id}/{uuid.uuid4()}-{Path(file.filename).name}"
     try:
         s3_client().put_object(Bucket=os.environ["S3_BUCKET"], Key=key, Body=data, ContentType=file.content_type or "application/octet-stream")
-        content = data.decode("utf-8", errors="ignore") if Path(file.filename).suffix.lower() == ".txt" else ""
-        status = "READY" if content else "REVIEW_REQUIRED"
+        pages = extract_pages(data, file.filename)
+        status = "READY" if any(content.strip() for _, content in pages) else "REVIEW_REQUIRED"
         with Session(engine) as session:
             document = Document(id=document_id, project_id=project_id, filename=file.filename, department_id=department_id, storage_key=key, status=status)
             session.add(document)
-            if content:
-                for page, chunk_text in enumerate(split_chunks(content), 1):
+            for page, content in pages:
+                for chunk_text in split_chunks(content):
+                    if not chunk_text.strip():
+                        continue
                     embedding = await QwenEmbeddingProvider().embed(chunk_text)
                     session.add(Chunk(id=str(uuid.uuid4()), document_id=document_id, project_id=project_id, department_id=department_id, page=page, text=chunk_text, normalized_text=normalize_text(chunk_text), embedding=embedding))
             session.commit()
-        return {"id": document_id, "status": status, "message": "文本已索引；PDF/DOCX 需接入解析器后完成处理"}
+        return {"id": document_id, "status": status, "message": "原生 PDF/TXT 已按页分块；无文本页面需百度 OCR 后复核"}
     except Exception as exc:
         with Session(engine) as session:
             session.add(Document(id=document_id, project_id=project_id, filename=file.filename, department_id=department_id, storage_key=key, status="FAILED", failure_reason=str(exc)))
