@@ -124,28 +124,18 @@ class QwenEmbeddingProvider:
             return response.json()["output"]["embeddings"][0]["embedding"]
 
 
-class AzureDocumentIntelligenceProvider:
-    async def analyze(self, data: bytes, content_type: str) -> dict | None:
-        endpoint, key = os.getenv("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT"), os.getenv("AZURE_DOCUMENT_INTELLIGENCE_KEY")
-        if not endpoint or not key:
+class BaiduOcrProvider:
+    async def recognize(self, data: bytes) -> dict | None:
+        api_key, secret_key = os.getenv("BAIDU_API_KEY"), os.getenv("BAIDU_SECRET_KEY")
+        if not api_key or not secret_key:
             return None
-        url = f"{endpoint.rstrip('/')}/documentModels/{os.getenv('AZURE_DOCUMENT_MODEL', 'prebuilt-layout')}:analyze?api-version=2024-11-30"
-        async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.post(url, headers={"Ocp-Apim-Subscription-Key": key, "Content-Type": content_type}, content=data)
+        async with httpx.AsyncClient(timeout=30) as client:
+            token_response = await client.post("https://aip.baidubce.com/oauth/2.0/token", params={"grant_type": "client_credentials", "client_id": api_key, "client_secret": secret_key})
+            token_response.raise_for_status()
+            token = token_response.json()["access_token"]
+            response = await client.post("https://aip.baidubce.com/rest/2.0/ocr/v1/general", params={"access_token": token}, data={"image": __import__("base64").b64encode(data).decode(), "probability": "true", "vertexes_location": "true"})
             response.raise_for_status()
-            operation = response.headers.get("Operation-Location")
-            if not operation:
-                return response.json()
-            for _ in range(30):
-                result = await client.get(operation, headers={"Ocp-Apim-Subscription-Key": key})
-                result.raise_for_status()
-                body = result.json()
-                if body.get("status") == "succeeded":
-                    return body.get("analyzeResult", body)
-                if body.get("status") == "failed":
-                    raise RuntimeError(body.get("error", {}).get("message", "Azure OCR 失败"))
-                await __import__("asyncio").sleep(2)
-        raise TimeoutError("Azure OCR 处理超时")
+            return response.json()
 
 
 def s3_client():
@@ -164,7 +154,7 @@ def startup() -> None:
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "llm": "deepseek", "embedding": "qwen", "ocr": "azure-document-intelligence", "database": "postgresql-pgvector", "storage": "s3"}
+    return {"status": "ok", "llm": "deepseek", "embedding": "qwen", "ocr": "baidu", "database": "postgresql-pgvector", "storage": "s3"}
 
 
 @app.post("/api/projects/{project_id}/documents")
