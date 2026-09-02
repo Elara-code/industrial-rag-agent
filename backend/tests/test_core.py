@@ -2,7 +2,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
-from app.main import can_access, normalize_text, split_chunks
+from app.main import can_access, merge_ranked, normalize_text, split_chunks
 
 
 def test_normalize_japanese_spacing():
@@ -18,3 +18,7 @@ def test_permission_filter():
 def test_chunking_has_bounded_chunks():
     chunks = split_chunks("a" * 10 + "\n" + "b" * 10, size=12)
     assert len(chunks) == 2 and all(len(chunk) <= 12 for chunk in chunks)
+
+
+def test_rrf_prefers_consistent_results():
+    assert merge_ranked(["a", "b"], ["b", "a"], ["b"])[0] == "b"

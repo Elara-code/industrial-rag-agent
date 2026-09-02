@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import uuid
+import json
 from io import BytesIO
 from datetime import datetime
 from pathlib import Path
@@ -10,6 +11,7 @@ from pathlib import Path
 import boto3
 import httpx
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pypdf import PdfReader
 from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, create_engine, select, text
@@ -61,6 +63,38 @@ class Feedback(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class Conversation(Base):
+    __tablename__ = "conversations"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    project_id: Mapped[str] = mapped_column(String(100), index=True)
+    user_department_id: Mapped[str] = mapped_column(String(100))
+    title: Mapped[str] = mapped_column(String(255), default="新会话")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class Message(Base):
+    __tablename__ = "messages"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(String(36), index=True)
+    role: Mapped[str] = mapped_column(String(20))
+    content: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(30), default="ANSWERED")
+    citations: Mapped[str] = mapped_column(Text, default="[]")
+    trace_id: Mapped[str] = mapped_column(String(36))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class AuditEvent(Base):
+    __tablename__ = "audit_events"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    actor_department_id: Mapped[str] = mapped_column(String(100))
+    action: Mapped[str] = mapped_column(String(50))
+    resource_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    result: Mapped[str] = mapped_column(String(30))
+    trace_id: Mapped[str] = mapped_column(String(36))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 def normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", value.replace("　", " ").lower()).strip()
 
@@ -92,6 +126,18 @@ def can_access(department_id: str, allowed_departments: list[str], visibility: s
     return visibility == "PROJECT_PUBLIC" or department_id in allowed_departments
 
 
+def merge_ranked(*ranked_lists: list[str], k: int = 60) -> list[str]:
+    scores: dict[str, float] = {}
+    for ranked in ranked_lists:
+        for rank, item in enumerate(ranked, 1):
+            scores[item] = scores.get(item, 0) + 1 / (k + rank)
+    return sorted(scores, key=scores.get, reverse=True)
+
+
+def audit(session: Session, user: DemoUser, action: str, result: str, trace_id: str, resource_id: str | None = None) -> None:
+    session.add(AuditEvent(id=str(uuid.uuid4()), actor_department_id=user.department_id, action=action, resource_id=resource_id, result=result, trace_id=trace_id))
+
+
 class DemoUser(BaseModel):
     department_id: str = "生产部"
     role: str = "employee"
@@ -106,6 +152,26 @@ class MessageRequest(BaseModel):
 class FeedbackRequest(BaseModel):
     kind: str
     note: str | None = None
+
+
+async def search_chunks(project_id: str, query: str, user: DemoUser, limit: int = 5) -> list[Chunk]:
+    normalized = normalize_text(query)
+    embedding = await QwenEmbeddingProvider().embed(query)
+    terms = [term for term in re.findall(r"[a-z0-9_-]+|[\u3040-\u30ff\u4e00-\u9fff]+", normalized) if len(term) > 1]
+    with Session(engine) as session:
+        base = select(Chunk).join(Document, Document.id == Chunk.document_id).where(Chunk.project_id == project_id, Document.status == "READY", Chunk.department_id.in_(user.allowed_departments))
+        lexical = base.where(Chunk.normalized_text.ilike(f"%{normalized}%") if normalized else False).limit(20)
+        lexical_chunks = session.scalars(lexical).all()
+        if terms:
+            keyword_chunks = session.scalars(base.where(*[Chunk.normalized_text.ilike(f"%{term}%") for term in terms[:6]]).limit(20)).all()
+        else:
+            keyword_chunks = []
+        semantic_chunks = []
+        if embedding:
+            semantic_chunks = session.scalars(base.where(Chunk.embedding.is_not(None)).order_by(Chunk.embedding.cosine_distance(embedding)).limit(20)).all()
+        by_id = {chunk.id: chunk for chunk in lexical_chunks + keyword_chunks + semantic_chunks}
+        ids = merge_ranked([c.id for c in semantic_chunks], [c.id for c in keyword_chunks], [c.id for c in lexical_chunks])[:limit]
+        return [by_id[item] for item in ids]
 
 
 class DeepSeekProvider:
@@ -154,6 +220,7 @@ def s3_client():
 
 
 app = FastAPI(title="日本企业可信知识问答 Agent API", version="0.1.0")
+app.add_middleware(CORSMiddleware, allow_origins=os.getenv("CORS_ORIGINS", "http://127.0.0.1:8765,http://localhost:8765").split(","), allow_methods=["*"], allow_headers=["*"])
 
 
 @app.on_event("startup")
@@ -166,6 +233,16 @@ def startup() -> None:
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok", "llm": "deepseek", "embedding": "qwen", "ocr": "baidu", "database": "postgresql-pgvector", "storage": "s3"}
+
+
+@app.post("/api/projects/{project_id}/conversations")
+def create_conversation(project_id: str, user: DemoUser = DemoUser()) -> dict:
+    conversation_id = str(uuid.uuid4())
+    with Session(engine) as session:
+        session.add(Conversation(id=conversation_id, project_id=project_id, user_department_id=user.department_id))
+        audit(session, user, "conversation.create", "success", conversation_id, conversation_id)
+        session.commit()
+    return {"id": conversation_id, "project_id": project_id}
 
 
 @app.post("/api/projects/{project_id}/documents")
@@ -207,19 +284,25 @@ def list_documents(project_id: str, user: DemoUser = DemoUser()) -> list[dict]:
 
 @app.post("/api/projects/{project_id}/conversations/{conversation_id}/messages")
 async def answer(project_id: str, conversation_id: str, request: MessageRequest) -> dict:
-    query = normalize_text(request.content)
-    with Session(engine) as session:
-        chunks = session.scalars(select(Chunk).join(Document, Document.id == Chunk.document_id).where(Chunk.project_id == project_id, Document.status == "READY", Chunk.department_id.in_(request.user.allowed_departments), Chunk.normalized_text.ilike(f"%{query}%")).limit(5)).all()
+    trace_id = str(uuid.uuid4())
+    chunks = await search_chunks(project_id, request.content, request.user)
     evidence = [{"chunk_id": c.id, "document_id": c.document_id, "page": c.page, "text": c.text, "confidence": c.confidence} for c in chunks]
     if not evidence:
-        return {"status": "REFUSED", "answer": "根据当前已授权知识库无法确认该问题。请补充设备型号或上传相关资料。", "citations": [], "trace_id": str(uuid.uuid4())}
-    answer_text = await DeepSeekProvider().answer(request.content, evidence)
-    return {"status": "ANSWERED", "answer": answer_text, "citations": evidence, "trace_id": str(uuid.uuid4()), "conversation_id": conversation_id}
+        answer_text, status = "根据当前已授权知识库无法确认该问题。请补充设备型号或上传相关资料。", "REFUSED"
+    else:
+        answer_text, status = await DeepSeekProvider().answer(request.content, evidence), "ANSWERED"
+    message_id = str(uuid.uuid4())
+    with Session(engine) as session:
+        session.add(Message(id=message_id, conversation_id=conversation_id, role="assistant", content=answer_text, status=status, citations=json.dumps(evidence, ensure_ascii=False), trace_id=trace_id))
+        audit(session, request.user, "message.answer", "refused" if status == "REFUSED" else "success", trace_id, message_id)
+        session.commit()
+    return {"id": message_id, "status": status, "answer": answer_text, "citations": evidence, "trace_id": trace_id, "conversation_id": conversation_id}
 
 
 @app.post("/api/messages/{message_id}/feedback")
 def feedback(message_id: str, request: FeedbackRequest) -> dict:
     with Session(engine) as session:
         session.add(Feedback(id=str(uuid.uuid4()), message_id=message_id, kind=request.kind, note=request.note))
+        audit(session, DemoUser(), "feedback.create", "success", str(uuid.uuid4()), message_id)
         session.commit()
     return {"status": "saved"}
