@@ -1,6 +1,6 @@
 # 日本企业可信知识问答 Agent
 
-基于空仓库 `Elara-code/industrial-rag-agent` 的 Phase 0 可运行原型。
+基于 `Elara-code/industrial-rag-agent` 的 Phase 0 可运行原型和后端骨架。
 
 ## 已实现
 
@@ -11,6 +11,8 @@
 - 知识库：文档版本、部门和解析/索引状态。
 - 评测中心：准确率、引用正确率、拒答率、延迟与失败归因。
 - 反馈与风险：高风险操作、纠正意见和处理状态。
+- 后端 API：FastAPI、PostgreSQL + pgvector、S3、DeepSeek、千问 Embedding、Azure OCR 适配配置。
+- 评测数据：`data/evaluation_cases.json`，共 40 条中日文测试问题。
 
 ## 运行
 
@@ -18,4 +20,12 @@
 python3 -m http.server 8765
 ```
 
-打开 `http://127.0.0.1:8765/`。当前为前端演示数据，尚未接入 FastAPI、PostgreSQL 或真实模型 Provider。
+打开 `http://127.0.0.1:8765/` 查看前端。启动后端：
+
+```bash
+pip install -r requirements.txt
+docker compose up -d postgres
+uvicorn backend.app.main:app --reload
+```
+
+后端默认连接本地 PostgreSQL。真实运行还需配置 `DEEPSEEK_API_KEY`、`DASHSCOPE_API_KEY`、`S3_BUCKET`、S3 凭据及 Azure Document Intelligence 凭据。当前 PDF/DOCX 上传会进入待复核状态，下一步接入 Azure 解析结果后再索引。
