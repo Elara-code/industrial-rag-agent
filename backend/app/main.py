@@ -4,6 +4,7 @@ import os
 import re
 import uuid
 import json
+import base64
 from io import BytesIO
 from datetime import datetime
 from pathlib import Path
@@ -14,6 +15,11 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pypdf import PdfReader
+from docx import Document as DocxDocument
+try:
+    import fitz
+except ImportError:  # 扫描 PDF 仅在安装 PyMuPDF 后启用
+    fitz = None
 from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, create_engine, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 from pgvector.sqlalchemy import Vector
@@ -95,6 +101,17 @@ class AuditEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class EvaluationRun(Base):
+    __tablename__ = "evaluation_runs"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    project_id: Mapped[str] = mapped_column(String(100), index=True)
+    status: Mapped[str] = mapped_column(String(30), default="COMPLETED")
+    parameters: Mapped[str] = mapped_column(Text, default="{}")
+    metrics: Mapped[str] = mapped_column(Text, default="{}")
+    results: Mapped[str] = mapped_column(Text, default="[]")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 def normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", value.replace("　", " ").lower()).strip()
 
@@ -119,7 +136,22 @@ def extract_pages(data: bytes, filename: str) -> list[tuple[int, str]]:
         return [(1, data.decode("utf-8", errors="ignore"))]
     if suffix == ".pdf":
         return [(page_number, page.extract_text() or "") for page_number, page in enumerate(PdfReader(BytesIO(data)).pages, 1)]
+    if suffix == ".docx":
+        content = "\n".join(paragraph.text for paragraph in DocxDocument(BytesIO(data)).paragraphs if paragraph.text.strip())
+        return [(1, content)]
     return []
+
+
+def render_pdf_page(data: bytes, page_number: int) -> bytes:
+    if fitz is None:
+        raise RuntimeError("扫描 PDF 需要安装 PyMuPDF")
+    document = fitz.open(stream=data, filetype="pdf")
+    page = document.load_page(page_number - 1)
+    return page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False).tobytes("png")
+
+
+def ocr_text(result: dict) -> str:
+    return "\n".join(item.get("words", "") for item in result.get("words_result", []))
 
 
 def can_access(department_id: str, allowed_departments: list[str], visibility: str) -> bool:
@@ -152,6 +184,11 @@ class MessageRequest(BaseModel):
 class FeedbackRequest(BaseModel):
     kind: str
     note: str | None = None
+
+
+class EvaluationRequest(BaseModel):
+    user: DemoUser = DemoUser()
+    limit: int = 40
 
 
 async def search_chunks(project_id: str, query: str, user: DemoUser, limit: int = 5) -> list[Chunk]:
@@ -210,7 +247,7 @@ class BaiduOcrProvider:
             token_response = await client.post("https://aip.baidubce.com/oauth/2.0/token", params={"grant_type": "client_credentials", "client_id": api_key, "client_secret": secret_key})
             token_response.raise_for_status()
             token = token_response.json()["access_token"]
-            response = await client.post("https://aip.baidubce.com/rest/2.0/ocr/v1/general", params={"access_token": token}, data={"image": __import__("base64").b64encode(data).decode(), "probability": "true", "vertexes_location": "true"})
+            response = await client.post("https://aip.baidubce.com/rest/2.0/ocr/v1/general", params={"access_token": token}, data={"image": base64.b64encode(data).decode(), "probability": "true", "vertexes_location": "true"})
             response.raise_for_status()
             return response.json()
 
@@ -256,16 +293,23 @@ async def upload_document(project_id: str, department_id: str, file: UploadFile 
     try:
         s3_client().put_object(Bucket=os.environ["S3_BUCKET"], Key=key, Body=data, ContentType=file.content_type or "application/octet-stream")
         pages = extract_pages(data, file.filename)
-        status = "READY" if any(content.strip() for _, content in pages) else "REVIEW_REQUIRED"
+        page_records = [(page, content, 1.0) for page, content in pages]
+        if Path(file.filename).suffix.lower() == ".pdf" and any(not content.strip() for _, content in pages) and os.getenv("BAIDU_API_KEY") and os.getenv("BAIDU_SECRET_KEY"):
+            for page, content, _ in page_records:
+                if content.strip():
+                    continue
+                result = await BaiduOcrProvider().recognize(render_pdf_page(data, page))
+                page_records[page - 1] = (page, ocr_text(result or {}), 0.8)
+        status = "READY" if any(content.strip() for _, content, _ in page_records) else "REVIEW_REQUIRED"
         with Session(engine) as session:
             document = Document(id=document_id, project_id=project_id, filename=file.filename, department_id=department_id, storage_key=key, status=status)
             session.add(document)
-            for page, content in pages:
+            for page, content, confidence in page_records:
                 for chunk_text in split_chunks(content):
                     if not chunk_text.strip():
                         continue
                     embedding = await QwenEmbeddingProvider().embed(chunk_text)
-                    session.add(Chunk(id=str(uuid.uuid4()), document_id=document_id, project_id=project_id, department_id=department_id, page=page, text=chunk_text, normalized_text=normalize_text(chunk_text), embedding=embedding))
+                    session.add(Chunk(id=str(uuid.uuid4()), document_id=document_id, project_id=project_id, department_id=department_id, page=page, text=chunk_text, normalized_text=normalize_text(chunk_text), confidence=confidence, embedding=embedding))
             session.commit()
         return {"id": document_id, "status": status, "message": "原生 PDF/TXT 已按页分块；无文本页面需百度 OCR 后复核"}
     except Exception as exc:
@@ -306,3 +350,44 @@ def feedback(message_id: str, request: FeedbackRequest) -> dict:
         audit(session, DemoUser(), "feedback.create", "success", str(uuid.uuid4()), message_id)
         session.commit()
     return {"status": "saved"}
+
+
+def fact_tokens(value: str) -> list[str]:
+    return [token for token in re.findall(r"[a-z0-9_-]+|[\u3040-\u30ff\u4e00-\u9fff]+", normalize_text(value)) if len(token) > 1]
+
+
+@app.post("/api/projects/{project_id}/evaluations/runs")
+async def run_evaluation(project_id: str, request: EvaluationRequest) -> dict:
+    source = Path(__file__).parents[2] / "data" / "evaluation_cases.json"
+    cases = json.loads(source.read_text(encoding="utf-8"))[: max(1, min(request.limit, 40))]
+    results, started = [], datetime.utcnow()
+    for case in cases:
+        chunks = await search_chunks(project_id, case["question"], request.user)
+        evidence = [{"chunk_id": c.id, "document_id": c.document_id, "page": c.page, "text": c.text, "confidence": c.confidence} for c in chunks]
+        should_refuse = case["category"] in {"无答案", "安全拒答"} or "拒答" in case["gold_answer"]
+        if not evidence:
+            answer_text, status = "根据当前知识库无法确认。", "REFUSED"
+        else:
+            answer_text, status = await DeepSeekProvider().answer(case["question"], evidence), "ANSWERED"
+        expected = fact_tokens(case["gold_answer"])
+        fact_match = bool(expected) and any(token in normalize_text(answer_text) for token in expected)
+        answer_correct = status == "REFUSED" if should_refuse else fact_match
+        citation_correct = not case["gold_sources"] or bool(evidence)
+        results.append({"id": case["id"], "status": status, "answer_correct": answer_correct, "citation_correct": citation_correct, "citations": evidence})
+    total = len(results)
+    metrics = {"total": total, "answer_accuracy": round(sum(r["answer_correct"] for r in results) / total, 4), "citation_accuracy": round(sum(r["citation_correct"] for r in results) / total, 4), "refusal_accuracy": round(sum(r["status"] == "REFUSED" for r in results if any(c["id"] == r["id"] and (c["category"] in {"无答案", "安全拒答"} or "拒答" in c["gold_answer"]) for c in cases)) / max(1, sum(c["category"] in {"无答案", "安全拒答"} or "拒答" in c["gold_answer"] for c in cases)), 4)}
+    run_id = str(uuid.uuid4())
+    with Session(engine) as session:
+        session.add(EvaluationRun(id=run_id, project_id=project_id, parameters=json.dumps(request.model_dump(), ensure_ascii=False), metrics=json.dumps(metrics, ensure_ascii=False), results=json.dumps(results, ensure_ascii=False)))
+        audit(session, request.user, "evaluation.run", "success", run_id, run_id)
+        session.commit()
+    return {"id": run_id, "status": "COMPLETED", "metrics": metrics, "results": results, "elapsed_ms": int((datetime.utcnow() - started).total_seconds() * 1000)}
+
+
+@app.get("/api/evaluations/{run_id}")
+def get_evaluation(run_id: str) -> dict:
+    with Session(engine) as session:
+        run = session.get(EvaluationRun, run_id)
+        if not run:
+            raise HTTPException(404, "评测记录不存在")
+        return {"id": run.id, "project_id": run.project_id, "status": run.status, "parameters": json.loads(run.parameters), "metrics": json.loads(run.metrics), "results": json.loads(run.results)}

@@ -14,6 +14,7 @@
 - 后端 API：FastAPI、PostgreSQL + pgvector、S3、DeepSeek、千问 Embedding、百度 OCR 适配配置。
 - 评测数据：`data/evaluation_cases.json`，共 40 条中日文测试问题。
 - 样本文档：`data/sample_documents/`，包含 DOCX、可提取 PDF 和扫描 PDF。
+- 评测 API：批量运行 40 条测试并保存指标和逐题结果。
 
 ## 运行
 
@@ -31,7 +32,15 @@ uvicorn backend.app.main:app --reload
 
 后端默认连接本地 PostgreSQL。真实运行还需配置 `DEEPSEEK_API_KEY`、`DASHSCOPE_API_KEY`、`BAIDU_API_KEY`、`BAIDU_SECRET_KEY`、`S3_BUCKET` 和 S3 凭据。原生 PDF/TXT 会按页提取并分块；无文本扫描页再使用百度 OCR。百度 OCR 的通用文字识别接口要求将图片 Base64 后通过 HTTPS POST 提交，并使用 API Key/Secret Key 换取 access_token。
 
-样本文档处理策略：`sample-resume.docx` 需要补充 DOCX 文本解析，`sample-heavy.pdf` 走原生 PDF 提取后人工复核，`sample-scanned.pdf` 走百度 OCR。
+样本文档处理策略：`sample-resume.docx` 走 DOCX 文本解析，`sample-heavy.pdf` 对空白页转图后走百度 OCR，`sample-scanned.pdf` 全部页面转图后走百度 OCR。
+
+运行评测：
+
+```bash
+curl -X POST 'http://127.0.0.1:8000/api/projects/demo/evaluations/runs' \
+  -H 'Content-Type: application/json' \
+  -d '{"limit":40,"user":{"department_id":"生产部","role":"employee","allowed_departments":["生产部"]}}'
+```
 
 上传第一份样本文档：
 
