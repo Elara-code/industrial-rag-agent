@@ -17,6 +17,7 @@ import boto3
 import httpx
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from pypdf import PdfReader
 from docx import Document as DocxDocument
@@ -352,11 +353,6 @@ def health() -> dict:
     return {"status": "ok", "llm": "deepseek", "embedding": "qwen", "ocr": "baidu", "database": "postgresql-pgvector", "storage": "s3"}
 
 
-@app.get("/")
-def root() -> dict:
-    return {"service": "日本企业可信知识问答 Agent API", "status": "ok", "health": "/health", "docs": "/docs"}
-
-
 @app.post("/api/projects/{project_id}/conversations")
 def create_conversation(project_id: str, user: DemoUser = DemoUser()) -> dict:
     conversation_id = str(uuid.uuid4())
@@ -594,3 +590,6 @@ def get_evaluation(run_id: str) -> dict:
         if not run:
             raise HTTPException(404, "评测记录不存在")
         return {"id": run.id, "project_id": run.project_id, "status": run.status, "parameters": json.loads(run.parameters), "metrics": json.loads(run.metrics), "results": json.loads(run.results)}
+
+
+app.mount("/", StaticFiles(directory=Path(__file__).parents[2], html=True), name="frontend")
