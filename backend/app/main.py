@@ -352,7 +352,7 @@ def startup() -> None:
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "llm": "deepseek", "embedding": "qwen", "ocr": "baidu", "database": "postgresql-pgvector", "storage": "s3", "configuration": {"deepseek": bool(os.getenv("DEEPSEEK_API_KEY")), "dashscope": bool(os.getenv("DASHSCOPE_API_KEY")), "baidu": bool(os.getenv("BAIDU_API_KEY") and os.getenv("BAIDU_SECRET_KEY")), "s3": bool(os.getenv("S3_BUCKET") and os.getenv("AWS_ACCESS_KEY_ID") and os.getenv("AWS_SECRET_ACCESS_KEY"))}}
+    return {"status": "ok", "llm": "deepseek", "embedding": "qwen", "ocr": "baidu", "database": "postgresql-pgvector", "storage": "s3", "config_deepseek": bool(os.getenv("DEEPSEEK_API_KEY")), "config_dashscope": bool(os.getenv("DASHSCOPE_API_KEY")), "config_baidu": bool(os.getenv("BAIDU_API_KEY") and os.getenv("BAIDU_SECRET_KEY")), "config_s3": bool(os.getenv("S3_BUCKET") and os.getenv("AWS_ACCESS_KEY_ID") and os.getenv("AWS_SECRET_ACCESS_KEY"))}
 
 
 @app.post("/api/projects/{project_id}/conversations")
