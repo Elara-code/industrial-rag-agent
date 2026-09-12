@@ -5,6 +5,10 @@ import re
 import uuid
 import json
 import base64
+import asyncio
+import threading
+import unicodedata
+from difflib import SequenceMatcher
 from io import BytesIO
 from datetime import datetime
 from pathlib import Path
@@ -20,11 +24,11 @@ try:
     import fitz
 except ImportError:  # 扫描 PDF 仅在安装 PyMuPDF 后启用
     fitz = None
-from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, create_engine, select, text
+from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, create_engine, or_, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 from pgvector.sqlalchemy import Vector
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://nihon:nihon@localhost:5432/nihon_agent")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://nihon:nihon@localhost:5433/nihon_agent")
 EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1024"))
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
@@ -113,7 +117,8 @@ class EvaluationRun(Base):
 
 
 def normalize_text(value: str) -> str:
-    return re.sub(r"\s+", " ", value.replace("　", " ").replace("‑", "-").replace("−", "-").replace("–", "-").replace("—", "-").lower()).strip()
+    value = unicodedata.normalize("NFKC", value).replace("‐", "-").replace("‑", "-").replace("−", "-").replace("–", "-").replace("—", "-")
+    return re.sub(r"\s+", " ", value.replace("　", " ").lower()).strip()
 
 
 def split_chunks(value: str, size: int = 800) -> list[str]:
@@ -188,27 +193,31 @@ class FeedbackRequest(BaseModel):
 
 class EvaluationRequest(BaseModel):
     user: DemoUser = DemoUser()
-    limit: int = 40
+    limit: int = 100
 
 
-async def search_chunks(project_id: str, query: str, user: DemoUser, limit: int = 3) -> list[Chunk]:
+async def search_chunks(project_id: str, query: str, user: DemoUser, limit: int = 2, embedding: list[float] | None = None) -> list[Chunk]:
     normalized = normalize_text(query)
-    embedding = await QwenEmbeddingProvider().embed(query)
+    if embedding is None:
+        embedding = await QwenEmbeddingProvider().embed(query)
     terms = [term for term in re.findall(r"[a-z0-9_-]+|[\u3040-\u30ff\u4e00-\u9fff]+", normalized) if len(term) > 1]
     with Session(engine) as session:
         base = select(Chunk).join(Document, Document.id == Chunk.document_id).where(Chunk.project_id == project_id, Document.status == "READY", Chunk.department_id.in_(user.allowed_departments))
         lexical = base.where(Chunk.normalized_text.ilike(f"%{normalized}%") if normalized else False).limit(20)
         lexical_chunks = session.scalars(lexical).all()
         if terms:
-            keyword_chunks = session.scalars(base.where(*[Chunk.normalized_text.ilike(f"%{term}%") for term in terms[:6]]).limit(20)).all()
+            keyword_chunks = session.scalars(base.where(or_(*[Chunk.normalized_text.ilike(f"%{term}%") for term in terms[:8]])).limit(20)).all()
         else:
             keyword_chunks = []
         semantic_chunks = []
         if embedding:
             semantic_chunks = session.scalars(base.where(Chunk.embedding.is_not(None)).order_by(Chunk.embedding.cosine_distance(embedding)).limit(20)).all()
         by_id = {chunk.id: chunk for chunk in lexical_chunks + keyword_chunks + semantic_chunks}
-        ids = merge_ranked([c.id for c in semantic_chunks], [c.id for c in keyword_chunks], [c.id for c in lexical_chunks])[:limit]
-    return [by_id[item] for item in ids]
+        ids = merge_ranked([c.id for c in semantic_chunks], [c.id for c in keyword_chunks], [c.id for c in lexical_chunks])[:20]
+    candidates = [by_id[item] for item in ids]
+    if os.getenv("RERANKER_ENABLED", "false").lower() == "true" and candidates:
+        return await rerank_chunks(query, candidates, limit)
+    return candidates[:limit]
 
 
 def evidence_from_chunks(chunks: list[Chunk]) -> list[dict]:
@@ -236,15 +245,70 @@ class DeepSeekProvider:
 
 
 class QwenEmbeddingProvider:
+    _cache: dict[str, list[float] | None] = {}
+
     async def embed(self, value: str) -> list[float] | None:
+        normalized = normalize_text(value)
+        if normalized in self._cache:
+            return self._cache[normalized]
+        result = (await self.embed_many([value]))[0]
+        self._cache[normalized] = result
+        return result
+
+    async def embed_many(self, values: list[str]) -> list[list[float] | None]:
+        cached = [self._cache.get(normalize_text(value), ...) for value in values]
+        missing = [value for value, result in zip(values, cached) if result is ...]
+        if not missing:
+            return cached
         key = os.getenv("DASHSCOPE_API_KEY")
         if not key:
-            return None
-        payload = {"model": os.getenv("QWEN_EMBEDDING_MODEL", "text-embedding-v3"), "input": {"texts": [value]}, "parameters": {"dimension": EMBEDDING_DIM}}
+            return [None for _ in values]
+        batch_size = max(1, int(os.getenv("QWEN_EMBEDDING_BATCH_SIZE", "10")))
+        generated: list[list[float]] = []
         async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.post("https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding", headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, json=payload)
-            response.raise_for_status()
-            return response.json()["output"]["embeddings"][0]["embedding"]
+            for start in range(0, len(missing), batch_size):
+                payload = {"model": os.getenv("QWEN_EMBEDDING_MODEL", "text-embedding-v3"), "input": {"texts": missing[start:start + batch_size]}, "parameters": {"dimension": EMBEDDING_DIM}}
+                response = await client.post("https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding", headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, json=payload)
+                response.raise_for_status()
+                generated.extend(item["embedding"] for item in response.json()["output"]["embeddings"])
+        generated_iter = iter(generated)
+        result = []
+        for value, item in zip(values, cached):
+            item = next(generated_iter) if item is ... else item
+            self._cache[normalize_text(value)] = item
+            result.append(item)
+        return result
+
+
+_reranker = None
+_reranker_lock = threading.Lock()
+_rerank_semaphore = asyncio.Semaphore(1)
+
+
+def get_reranker():
+    global _reranker
+    if _reranker is None:
+        with _reranker_lock:
+            if _reranker is None:
+                from FlagEmbedding import FlagReranker
+                _reranker = FlagReranker(
+                    os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3"),
+                    use_fp16=os.getenv("RERANKER_FP16", "false").lower() == "true",
+                    devices=os.getenv("RERANKER_DEVICE", "cpu"),
+                    batch_size=int(os.getenv("RERANKER_BATCH_SIZE", "16")),
+                    max_length=int(os.getenv("RERANKER_MAX_LENGTH", "512")),
+                )
+    return _reranker
+
+
+async def rerank_chunks(query: str, chunks: list[Chunk], limit: int) -> list[Chunk]:
+    pairs = [[query, chunk.text] for chunk in chunks]
+    async with _rerank_semaphore:
+        scores = await asyncio.to_thread(lambda: get_reranker().compute_score(pairs, normalize=True))
+    if isinstance(scores, float):
+        scores = [scores]
+    ranked = sorted(zip(scores, chunks), key=lambda item: item[0], reverse=True)
+    return [chunk for _, chunk in ranked[:limit]]
 
 
 async def generate_answer(question: str, evidence: list[dict]) -> tuple[str, str]:
@@ -351,6 +415,7 @@ async def answer(project_id: str, conversation_id: str, request: MessageRequest)
         answer_text, status = "根据当前已授权知识库无法确认该问题。请补充设备型号或上传相关资料。", "REFUSED"
     else:
         answer_text, status = await generate_answer(request.content, evidence)
+        evidence = [citation for citation in evidence if evidence_supports_answer(citation, answer_text)]
     message_id = str(uuid.uuid4())
     with Session(engine) as session:
         session.add(Message(id=message_id, conversation_id=conversation_id, role="assistant", content=answer_text, status=status, citations=json.dumps(evidence, ensure_ascii=False), trace_id=trace_id))
@@ -376,13 +441,55 @@ def fact_tokens(value: str) -> list[str]:
 
 
 def answer_matches_facts(answer: str, expected_answer: str) -> bool:
-    expected = fact_tokens(expected_answer)
-    normalized_answer = normalize_text(answer)
-    if expected and all(token in normalized_answer for token in expected):
+    expected, normalized_answer = fact_tokens(expected_answer), compact_text(answer)
+    exact_facts = exact_fact_tokens(expected_answer)
+    if any(fact not in normalized_answer for fact in exact_facts):
+        return False
+    if not expected:
+        return bool(normalize_text(expected_answer))
+    covered = sum(token in normalized_answer for token in expected)
+    if covered == len(expected):
         return True
-    compact_expected = re.sub(r"(?:より|です|ます|でした|ました|する|した|の|は|が|を|に|で|と|へ|や)", "", normalize_text(expected_answer))
+    if exact_facts and covered >= len(expected) - 1:
+        return True
+    compact_expected = re.sub(r"(?:より|です|ます|でした|ました|する|した|の|は|が|を|に|で|と|へ|や)", "", compact_text(expected_answer))
     compact_answer = re.sub(r"(?:より|です|ます|でした|ました|する|した|の|は|が|を|に|で|と|へ|や)", "", normalized_answer)
-    return bool(compact_expected) and compact_expected in compact_answer
+    return SequenceMatcher(None, compact_expected, compact_answer).ratio() >= 0.72 and covered / len(expected) >= 0.5
+
+
+def compact_text(value: str) -> str:
+    return re.sub(r"\s+", "", normalize_text(value))
+
+
+def exact_fact_tokens(value: str) -> list[str]:
+    return re.findall(r"[a-z]+[-_]?\d+[a-z0-9_-]*|\d+(?:\.\d+)?(?:[a-z%℃年年月日時間件分]+)?", normalize_text(value))
+
+
+def has_exact_fact_conflict(answer: str, expected_answer: str) -> bool:
+    expected_text, answer_text = compact_text(expected_answer), compact_text(answer)
+    expected_ids = re.findall(r"[a-z]+[-_]?\d+[a-z0-9_-]*", expected_text)
+    answer_ids = re.findall(r"[a-z]+[-_]?\d+[a-z0-9_-]*", answer_text)
+    if expected_ids and answer_ids and any(identifier not in answer_ids for identifier in expected_ids):
+        return True
+    expected_numbers = re.findall(r"\d+(?:\.\d+)?", expected_text)
+    answer_numbers = re.findall(r"\d+(?:\.\d+)?", answer_text)
+    return bool(expected_numbers and answer_numbers and any(number not in answer_numbers for number in expected_numbers))
+
+
+def cosine_similarity(left: list[float], right: list[float]) -> float:
+    numerator = sum(a * b for a, b in zip(left, right))
+    left_norm = sum(a * a for a in left) ** 0.5
+    right_norm = sum(b * b for b in right) ** 0.5
+    return numerator / (left_norm * right_norm) if left_norm and right_norm else 0.0
+
+
+def evidence_supports_answer(citation: dict, answer: str) -> bool:
+    text = compact_text(citation.get("text", ""))
+    exact_facts = exact_fact_tokens(answer)
+    if exact_facts:
+        return all(fact in text for fact in exact_facts)
+    tokens = [compact_text(token) for token in fact_tokens(answer)]
+    return bool(tokens) and sum(token in text for token in tokens) >= max(1, (len(tokens) + 2) // 3)
 
 
 def citation_matches(source: str, citation: dict) -> bool:
@@ -392,25 +499,81 @@ def citation_matches(source: str, citation: dict) -> bool:
     return citation.get("document_filename") == filename and str(citation.get("page")) == page
 
 
+def citation_score(sources: list[str], expected_answer: str, evidence: list[dict]) -> dict:
+    source_files = {source.rpartition(":p")[0] or source for source in sources}
+    supported = [citation for citation in evidence if any(citation_matches(source, citation) for source in sources) and answer_matches_facts(citation.get("text", ""), expected_answer)]
+    document_hit = float(any(citation.get("document_filename") in source_files for citation in evidence)) if sources else 0.0
+    page_hit = float(any(citation_matches(source, citation) for source in sources for citation in evidence)) if sources else 0.0
+    return {"document_hit": document_hit, "page_hit": page_hit, "chunk_precision": round(len(supported) / len(evidence), 4) if evidence else 0.0, "supported": len(supported), "shown": len(evidence)}
+
+
+def case_should_refuse(case: dict, user: DemoUser) -> bool:
+    return case.get("expected_behavior") == "refuse" or case.get("category") in {"无答案", "安全拒答", "权限拒答"} or "拒答" in case.get("gold_answer", "") or bool(case.get("required_department") and case["required_department"] not in user.allowed_departments)
+
+
 @app.post("/api/projects/{project_id}/evaluations/runs")
 async def run_evaluation(project_id: str, request: EvaluationRequest) -> dict:
     source = Path(__file__).parents[2] / "data" / "evaluation_cases.json"
-    cases = json.loads(source.read_text(encoding="utf-8"))[: max(1, min(request.limit, 40))]
+    all_cases = json.loads(source.read_text(encoding="utf-8"))
+    cases = all_cases[: max(1, min(request.limit, len(all_cases)))]
     results, started = [], datetime.utcnow()
-    for case in cases:
-        chunks = await search_chunks(project_id, case["question"], request.user)
-        evidence = evidence_from_chunks(chunks)
-        should_refuse = case["category"] in {"无答案", "安全拒答"} or "拒答" in case["gold_answer"]
-        if not evidence:
-            answer_text, status = "根据当前知识库无法确认。", "REFUSED"
-        else:
-            answer_text, status = await generate_answer(case["question"], evidence)
-        fact_match = answer_matches_facts(answer_text, case["gold_answer"])
-        answer_correct = status == "REFUSED" if should_refuse else fact_match
-        citation_correct = not case["gold_sources"] or any(citation_matches(source, citation) for source in case["gold_sources"] for citation in evidence)
-        results.append({"id": case["id"], "question": case["question"], "answer": answer_text, "gold_answer": case["gold_answer"], "status": status, "answer_correct": answer_correct, "citation_correct": citation_correct, "citations": evidence})
+    embeddings = await QwenEmbeddingProvider().embed_many([case["question"] for case in cases])
+    semaphore = asyncio.Semaphore(5)
+
+    async def evaluate(case: dict, embedding: list[float] | None) -> dict:
+        case_started = datetime.utcnow()
+        should_refuse = case_should_refuse(case, request.user)
+        try:
+            chunks = await search_chunks(project_id, case["question"], request.user, embedding=embedding)
+            evidence = evidence_from_chunks(chunks)
+            if not evidence:
+                answer_text, status = "根据当前知识库无法确认。", "REFUSED"
+            elif should_refuse:
+                answer_text, status = "根据当前已授权知识库无法确认该问题。", "REFUSED"
+            else:
+                async with semaphore:
+                    answer_text, status = await generate_answer(case["question"], evidence)
+            facts_correct = status == "REFUSED" if should_refuse else answer_matches_facts(answer_text, case["gold_answer"])
+            if should_refuse:
+                evidence = []
+            citation = citation_score(case.get("gold_sources", []), case["gold_answer"], evidence)
+            return {"id": case["id"], "question": case["question"], "answer": answer_text, "gold_answer": case["gold_answer"], "status": status, "answer_correct": facts_correct, "citation_correct": citation["chunk_precision"] == 1.0 if evidence else not case.get("gold_sources"), "citation": citation, "citations": evidence, "elapsed_ms": int((datetime.utcnow() - case_started).total_seconds() * 1000), "failure_reason": None}
+        except Exception as exc:
+            return {"id": case["id"], "question": case["question"], "answer": "", "gold_answer": case["gold_answer"], "status": "ERROR", "answer_correct": False, "citation_correct": False, "citation": {"document_hit": 0.0, "page_hit": 0.0, "chunk_precision": 0.0, "supported": 0, "shown": 0}, "citations": [], "elapsed_ms": int((datetime.utcnow() - case_started).total_seconds() * 1000), "failure_reason": str(exc)}
+
+    results = await asyncio.gather(*(evaluate(case, embedding) for case, embedding in zip(cases, embeddings)))
+    for result, case in zip(results, cases):
+        result["refusal_expected"] = case_should_refuse(case, request.user)
+    semantic_cases = [
+        (index, case, result)
+        for index, (case, result) in enumerate(zip(cases, results))
+        if not result["refusal_expected"] and not result["answer_correct"] and result["status"] == "ANSWERED" and not has_exact_fact_conflict(result["answer"], case["gold_answer"])
+    ]
+    if semantic_cases:
+        semantic_values = [value for _, case, result in semantic_cases for value in (result["answer"], case["gold_answer"])]
+        semantic_embeddings = await QwenEmbeddingProvider().embed_many(semantic_values)
+        for offset, (_, _, result) in enumerate(semantic_cases):
+            answer_embedding, gold_embedding = semantic_embeddings[offset * 2:offset * 2 + 2]
+            result["semantic_similarity"] = round(cosine_similarity(answer_embedding, gold_embedding), 4) if answer_embedding and gold_embedding else None
+            result["answer_correct"] = bool(result["semantic_similarity"] is not None and result["semantic_similarity"] >= 0.70)
+    for result in results:
+        result.setdefault("semantic_similarity", None)
     total = len(results)
-    metrics = {"total": total, "answer_accuracy": round(sum(r["answer_correct"] for r in results) / total, 4), "citation_accuracy": round(sum(r["citation_correct"] for r in results) / total, 4), "refusal_accuracy": round(sum(r["status"] == "REFUSED" for r in results if any(c["id"] == r["id"] and (c["category"] in {"无答案", "安全拒答"} or "拒答" in c["gold_answer"]) for c in cases)) / max(1, sum(c["category"] in {"无答案", "安全拒答"} or "拒答" in c["gold_answer"] for c in cases)), 4)}
+    refusal_cases = [r for r in results if r["refusal_expected"]]
+    no_answer_cases = [r for r, c in zip(results, cases) if c.get("expected_behavior") == "refuse"]
+    permission_cases = [r for r, c in zip(results, cases) if c.get("required_department") and c["required_department"] not in request.user.allowed_departments]
+    citation_cases = [r for r, c in zip(results, cases) if c.get("gold_sources")]
+    metrics = {
+        "total": total,
+        "answer_accuracy": round(sum(r["answer_correct"] for r in results if not r["refusal_expected"]) / max(1, total - len(refusal_cases)), 4),
+        "citation_accuracy": round(sum(r["citation"]["chunk_precision"] for r in citation_cases) / len(citation_cases), 4) if citation_cases else "N/A",
+        "document_hit_rate": round(sum(r["citation"]["document_hit"] for r in citation_cases) / len(citation_cases), 4) if citation_cases else "N/A",
+        "page_hit_rate": round(sum(r["citation"]["page_hit"] for r in citation_cases) / len(citation_cases), 4) if citation_cases else "N/A",
+        "chunk_precision": round(sum(r["citation"]["chunk_precision"] for r in citation_cases) / len(citation_cases), 4) if citation_cases else "N/A",
+        "no_answer_refusal_accuracy": round(sum(r["status"] == "REFUSED" for r in no_answer_cases) / len(no_answer_cases), 4) if no_answer_cases else "N/A",
+        "permission_refusal_accuracy": round(sum(r["status"] == "REFUSED" for r in permission_cases) / len(permission_cases), 4) if permission_cases else "N/A",
+        "refusal_accuracy": round(sum(r["status"] == "REFUSED" for r in refusal_cases) / len(refusal_cases), 4) if refusal_cases else "N/A",
+    }
     run_id = str(uuid.uuid4())
     with Session(engine) as session:
         session.add(EvaluationRun(id=run_id, project_id=project_id, parameters=json.dumps(request.model_dump(), ensure_ascii=False), metrics=json.dumps(metrics, ensure_ascii=False), results=json.dumps(results, ensure_ascii=False)))

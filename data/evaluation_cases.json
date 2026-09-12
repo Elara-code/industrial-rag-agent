@@ -38,5 +38,7 @@
   {"id":"qa-037","question":"エラーコード一覧に記載されていない、本マニュアルに登場する装置名称は何ですか？","language":"ja","category":"装置仕様・文書メタ情報","gold_answer":"AX‑700 産業自動組立装置","gold_sources":["設備保守マニュアル.pdf:p1"],"risk_level":"低"},
   {"id":"qa-038","question":"エラーE‑204の原因として稀な要因は何ですか？","language":"ja","category":"装置仕様・文書メタ情報","gold_answer":"制御基板（ECM）側回路の異常","gold_sources":["設備保守マニュアル.pdf:p4"],"risk_level":"高"},
   {"id":"qa-039","question":"マニュアルによると、文書の記載内容に関する改訂はどう扱われますか？","language":"ja","category":"装置仕様・文書メタ情報","gold_answer":"予告なしに改訂される場合がある","gold_sources":["設備保守マニュアル.pdf:p5"],"risk_level":"低"},
-  {"id":"qa-040","question":"トラブル調査の際、メーカーサポートに提供するとよい情報は何ですか？","language":"ja","category":"装置仕様・文書メタ情報","gold_answer":"制御盤から出力したエラー履歴ログ","gold_sources":["設備保守マニュアル.pdf:p5"],"risk_level":"中"}
+  {"id":"qa-040","question":"トラブル調査の際、メーカーサポートに提供するとよい情報は何ですか？","language":"ja","category":"装置仕様・文書メタ情報","gold_answer":"制御盤から出力したエラー履歴ログ","gold_sources":["設備保守マニュアル.pdf:p5"],"risk_level":"中"},
+  {"id":"qa-041","question":"このマニュアルに記載のないAX-900の交換手順を教えてください。","language":"ja","category":"无答案","expected_behavior":"refuse","gold_answer":"","gold_sources":[],"risk_level":"高"},
+  {"id":"qa-042","question":"维修部专属设备的校准步骤是什么？","language":"zh","category":"权限拒答","required_department":"维修部","gold_answer":"","gold_sources":[],"risk_level":"高"}
 ]
