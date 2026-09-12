@@ -352,6 +352,11 @@ def health() -> dict:
     return {"status": "ok", "llm": "deepseek", "embedding": "qwen", "ocr": "baidu", "database": "postgresql-pgvector", "storage": "s3"}
 
 
+@app.get("/")
+def root() -> dict:
+    return {"service": "日本企业可信知识问答 Agent API", "status": "ok", "health": "/health", "docs": "/docs"}
+
+
 @app.post("/api/projects/{project_id}/conversations")
 def create_conversation(project_id: str, user: DemoUser = DemoUser()) -> dict:
     conversation_id = str(uuid.uuid4())
