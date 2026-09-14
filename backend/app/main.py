@@ -10,7 +10,7 @@ import threading
 import unicodedata
 from difflib import SequenceMatcher
 from io import BytesIO
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import boto3
@@ -25,9 +25,10 @@ try:
     import fitz
 except ImportError:  # 扫描 PDF 仅在安装 PyMuPDF 后启用
     fitz = None
-from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, create_engine, or_, select, text
+from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, create_engine, func, or_, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 from pgvector.sqlalchemy import Vector
+from .decision_engine import evaluate_e204
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://nihon:nihon@localhost:5433/nihon_agent")
 EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1024"))
@@ -117,6 +118,37 @@ class EvaluationRun(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class Asset(Base):
+    __tablename__ = "assets"
+    id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    project_id: Mapped[str] = mapped_column(String(100), index=True)
+    model: Mapped[str] = mapped_column(String(100))
+    department_id: Mapped[str] = mapped_column(String(100), index=True)
+    operating_hours: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class AlarmEvent(Base):
+    __tablename__ = "alarm_events"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    project_id: Mapped[str] = mapped_column(String(100), index=True)
+    asset_id: Mapped[str] = mapped_column(String(100), index=True)
+    department_id: Mapped[str] = mapped_column(String(100), index=True)
+    error_code: Mapped[str] = mapped_column(String(50), index=True)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    duration_minutes: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class MaintenanceRecord(Base):
+    __tablename__ = "maintenance_records"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    project_id: Mapped[str] = mapped_column(String(100), index=True)
+    asset_id: Mapped[str] = mapped_column(String(100), index=True)
+    department_id: Mapped[str] = mapped_column(String(100), index=True)
+    action: Mapped[str] = mapped_column(Text)
+    result: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 def normalize_text(value: str) -> str:
     value = unicodedata.normalize("NFKC", value).replace("‐", "-").replace("‑", "-").replace("−", "-").replace("–", "-").replace("—", "-")
     return re.sub(r"\s+", " ", value.replace("　", " ").lower()).strip()
@@ -195,6 +227,17 @@ class FeedbackRequest(BaseModel):
 class EvaluationRequest(BaseModel):
     user: DemoUser = DemoUser()
     limit: int = 100
+
+
+class DecisionRequest(BaseModel):
+    asset_id: str
+    error_code: str
+    operating_hours: int | None = None
+    recent_count: int | None = None
+    connector_condition: str | None = None
+    sensor_resistance: str | None = None
+    power_off: bool | None = None
+    overheating: bool | None = None
 
 
 async def search_chunks(project_id: str, query: str, user: DemoUser, limit: int = 2, embedding: list[float] | None = None) -> list[Chunk]:
@@ -348,11 +391,56 @@ def startup() -> None:
     with engine.begin() as connection:
         connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
     Base.metadata.create_all(engine)
+    seed_operations()
+
+
+def seed_operations() -> None:
+    source = Path(__file__).parents[2] / "data" / "operation_events.json"
+    if not source.exists():
+        return
+    data = json.loads(source.read_text(encoding="utf-8"))
+    with Session(engine) as session:
+        if session.scalar(select(Asset.id).where(Asset.project_id == "demo").limit(1)):
+            return
+        for item in data["assets"]:
+            session.add(Asset(project_id="demo", **item))
+        for item in data["events"]:
+            session.add(AlarmEvent(id=str(uuid.uuid4()), project_id="demo", department_id="生产部", occurred_at=datetime.fromisoformat(item["occurred_at"]), **{key: value for key, value in item.items() if key != "occurred_at"}))
+        session.commit()
 
 
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok", "llm": "deepseek", "embedding": "qwen", "ocr": "baidu", "database": "postgresql-pgvector", "storage": "s3", "config_deepseek": bool(os.getenv("DEEPSEEK_API_KEY")), "config_dashscope": bool(os.getenv("DASHSCOPE_API_KEY")), "config_baidu": bool(os.getenv("BAIDU_API_KEY") and os.getenv("BAIDU_SECRET_KEY")), "config_s3": bool(os.getenv("S3_BUCKET") and os.getenv("AWS_ACCESS_KEY_ID") and os.getenv("AWS_SECRET_ACCESS_KEY"))}
+
+
+@app.get("/api/projects/{project_id}/trends")
+def trends(project_id: str, error_code: str = "E-204", days: int = 30, user: DemoUser = DemoUser()) -> dict:
+    since = datetime.utcnow() - timedelta(days=max(1, min(days, 365)))
+    with Session(engine) as session:
+        events = session.scalars(select(AlarmEvent).where(AlarmEvent.project_id == project_id, AlarmEvent.department_id.in_(user.allowed_departments), AlarmEvent.error_code == error_code, AlarmEvent.occurred_at >= since).order_by(AlarmEvent.occurred_at)).all()
+    buckets: dict[str, int] = {}
+    for event in events:
+        key = event.occurred_at.strftime("%Y-%m-%d")
+        buckets[key] = buckets.get(key, 0) + 1
+    return {"project_id": project_id, "error_code": error_code, "days": days, "total": len(events), "insufficient_data": len(events) < 2, "series": [{"date": key, "count": value} for key, value in sorted(buckets.items())], "assets": sorted({event.asset_id for event in events})}
+
+
+@app.post("/api/projects/{project_id}/decisions")
+def decision(project_id: str, request: DecisionRequest, user: DemoUser = DemoUser()) -> dict:
+    with Session(engine) as session:
+        asset = session.scalar(select(Asset).where(Asset.project_id == project_id, Asset.id == request.asset_id, Asset.department_id.in_(user.allowed_departments)))
+        if not asset:
+            raise HTTPException(404, "设备不存在或无权访问")
+        recent_count = session.scalar(select(func.count(AlarmEvent.id)).where(AlarmEvent.project_id == project_id, AlarmEvent.asset_id == request.asset_id, AlarmEvent.error_code == request.error_code, AlarmEvent.department_id.in_(user.allowed_departments), AlarmEvent.occurred_at >= datetime.utcnow() - timedelta(days=30))) or 0
+    values = request.model_dump()
+    values["operating_hours"] = request.operating_hours if request.operating_hours is not None else asset.operating_hours
+    values["recent_count"] = request.recent_count if request.recent_count is not None else recent_count
+    if request.error_code != "E-204":
+        raise HTTPException(400, "P0 当前仅支持 E-204 决策规则")
+    result = evaluate_e204(values)
+    result.update({"project_id": project_id, "asset_id": request.asset_id, "error_code": request.error_code, "operating_hours": values["operating_hours"], "recent_count": values["recent_count"]})
+    return result
 
 
 @app.post("/api/projects/{project_id}/conversations")
