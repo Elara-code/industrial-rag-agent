@@ -230,6 +230,7 @@ class EvaluationRequest(BaseModel):
 
 
 class DecisionRequest(BaseModel):
+    user: DemoUser = DemoUser()
     asset_id: str
     error_code: str
     operating_hours: int | None = None
@@ -427,7 +428,8 @@ def trends(project_id: str, error_code: str = "E-204", days: int = 30, user: Dem
 
 
 @app.post("/api/projects/{project_id}/decisions")
-def decision(project_id: str, request: DecisionRequest, user: DemoUser = DemoUser()) -> dict:
+def decision(project_id: str, request: DecisionRequest) -> dict:
+    user = request.user
     with Session(engine) as session:
         asset = session.scalar(select(Asset).where(Asset.project_id == project_id, Asset.id == request.asset_id, Asset.department_id.in_(user.allowed_departments)))
         if not asset:
