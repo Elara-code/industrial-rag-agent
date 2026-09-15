@@ -1,0 +1,6 @@
+[
+  {"id":"decision-001","input":{"power_off":null,"connector_condition":null},"expected_status":"NEEDS_INPUT","expected_risk":"HIGH","required_prohibited_actions":["不得直接复位后继续运行"]},
+  {"id":"decision-002","input":{"power_off":true,"connector_condition":"正常","overheating":true},"expected_status":"BLOCKED","expected_risk":"CRITICAL","required_actions":["停止运行","关闭主电源"]},
+  {"id":"decision-003","input":{"power_off":true,"connector_condition":"腐蚀","recent_count":4,"operating_hours":8600},"expected_status":"READY","expected_risk":"HIGH","required_actions":["使用接点クリーナー清洁或更换连接器"]},
+  {"id":"decision-004","input":{"power_off":true,"connector_condition":"正常","recent_count":1,"operating_hours":5000},"expected_status":"READY","expected_risk":"MEDIUM","required_actions":["检查冷却水温传感器"]}
+]

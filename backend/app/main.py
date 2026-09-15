@@ -441,8 +441,25 @@ def decision(project_id: str, request: DecisionRequest) -> dict:
     if request.error_code != "E-204":
         raise HTTPException(400, "P0 当前仅支持 E-204 决策规则")
     result = evaluate_e204(values)
-    result.update({"project_id": project_id, "asset_id": request.asset_id, "error_code": request.error_code, "operating_hours": values["operating_hours"], "recent_count": values["recent_count"]})
+    trace_id = str(uuid.uuid4())
+    with Session(engine) as session:
+        audit(session, user, "decision.evaluate", "success", trace_id, request.asset_id)
+        session.commit()
+    result.update({"project_id": project_id, "asset_id": request.asset_id, "error_code": request.error_code, "operating_hours": values["operating_hours"], "recent_count": values["recent_count"], "trace_id": trace_id})
     return result
+
+
+@app.post("/api/projects/{project_id}/decision-evaluations")
+def decision_evaluation(project_id: str) -> dict:
+    source = Path(__file__).parents[2] / "data" / "decision_evaluation_cases.json"
+    cases = json.loads(source.read_text(encoding="utf-8"))
+    results = []
+    for case in cases:
+        actual = evaluate_e204(case["input"])
+        action_hit = all(action in actual["actions"] for action in case.get("required_actions", []))
+        prohibited_hit = all(action in actual["prohibited_actions"] for action in case.get("required_prohibited_actions", []))
+        results.append({"id": case["id"], "status_correct": actual["status"] == case["expected_status"], "risk_correct": actual["risk"] == case["expected_risk"], "actions_correct": action_hit, "prohibited_actions_correct": prohibited_hit, "actual": actual})
+    return {"project_id": project_id, "total": len(results), "status_accuracy": round(sum(item["status_correct"] for item in results) / len(results), 4), "risk_accuracy": round(sum(item["risk_correct"] for item in results) / len(results), 4), "action_accuracy": round(sum(item["actions_correct"] for item in results) / len(results), 4), "results": results}
 
 
 @app.post("/api/projects/{project_id}/conversations")
